@@ -1,4 +1,4 @@
-"""Data-fetching layer — NSE India APIs with curl_cffi browser impersonation."""
+"""Data-fetching layer — NSE India APIs first, yfinance fallback for cloud."""
 from __future__ import annotations
 
 import datetime as dt
@@ -7,12 +7,29 @@ from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
-from curl_cffi import requests as cffi_requests
-from nsetools import Nse
 
 from config import NIFTY50_SYMBOLS, DEFAULT_PERIOD, DEFAULT_INTERVAL
 
 log = logging.getLogger(__name__)
+
+# ── Optional imports (graceful degradation) ───────────────────
+try:
+    from curl_cffi import requests as cffi_requests
+    _HAS_CURL_CFFI = True
+except ImportError:
+    _HAS_CURL_CFFI = False
+
+try:
+    from nsetools import Nse
+    _HAS_NSETOOLS = True
+except ImportError:
+    _HAS_NSETOOLS = False
+
+try:
+    import yfinance as yf
+    _HAS_YFINANCE = True
+except ImportError:
+    _HAS_YFINANCE = False
 
 _PERIOD_START_DAYS: dict[str, int] = {
     "1d": 5, "5d": 10, "1mo": 40, "3mo": 100, "6mo": 200,
@@ -37,8 +54,13 @@ INDEX_SYMBOLS = {
 
 # ── NSE session (curl_cffi with Chrome impersonation) ────────
 
-def _nse_session() -> cffi_requests.Session:
+_cached_session = None
+
+
+def _nse_session():
     """Create a curl_cffi session impersonating Chrome, with NSE cookies."""
+    if not _HAS_CURL_CFFI:
+        return None
     s = cffi_requests.Session(impersonate="chrome")
     s.headers.update({
         "Referer": "https://www.nseindia.com/",
@@ -48,10 +70,7 @@ def _nse_session() -> cffi_requests.Session:
     return s
 
 
-_cached_session: cffi_requests.Session | None = None
-
-
-def _get_session() -> cffi_requests.Session:
+def _get_session():
     global _cached_session
     if _cached_session is None:
         _cached_session = _nse_session()
@@ -65,9 +84,13 @@ def _reset_session():
 
 def _nse_get_json(path: str) -> dict | None:
     """GET JSON from NSE, retrying with a fresh session on failure."""
+    if not _HAS_CURL_CFFI:
+        return None
     for attempt in range(2):
         try:
             s = _get_session()
+            if s is None:
+                return None
             r = s.get(f"https://www.nseindia.com{path}", timeout=30)
             if r.status_code == 200:
                 return r.json()
@@ -263,13 +286,13 @@ def _nse_equity_daily_ohlc(symbol: str, period: str) -> pd.DataFrame:
 
 # ── nsetools client ──────────────────────────────────────────
 
-_nse_client: Nse | None = None
+_nse_client = None
 _nse_init_failed = False
 
 
-def _get_nse() -> Nse | None:
+def _get_nse():
     global _nse_client, _nse_init_failed
-    if _nse_init_failed:
+    if not _HAS_NSETOOLS or _nse_init_failed:
         return None
     if _nse_client is None:
         try:
@@ -279,6 +302,38 @@ def _get_nse() -> Nse | None:
             _nse_init_failed = True
             return None
     return _nse_client
+
+
+# ── yfinance fallback helpers ────────────────────────────────
+
+_YF_INDEX_MAP: dict[str, str] = {
+    "NIFTY 50": "^NSEI",
+    "NIFTY BANK": "^NSEBANK",
+    "BANK NIFTY": "^NSEBANK",
+    "INDIA VIX": "^INDIAVIX",
+}
+
+
+def _yf_download(ticker: str, period: str) -> pd.DataFrame:
+    """Download OHLCV via yfinance and normalise column names."""
+    if not _HAS_YFINANCE:
+        return pd.DataFrame()
+    try:
+        df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
+    except Exception as exc:
+        log.debug("yfinance download failed for %s: %s", ticker, exc)
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col not in df.columns:
+            return pd.DataFrame()
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+    df.index = pd.to_datetime(df.index).normalize()
+    df.index.name = "Date"
+    return df
 
 
 # ── Public API ───────────────────────────────────────────────
@@ -296,16 +351,20 @@ def get_stock_data(
     period: str = DEFAULT_PERIOD,
     interval: str = DEFAULT_INTERVAL,
 ) -> pd.DataFrame:
-    """Fetch historical OHLCV data for an NSE equity from NSE India."""
+    """Fetch historical OHLCV data — NSE India first, yfinance fallback."""
     symbol = normalize_symbol(symbol)
     df = _nse_equity_daily_ohlc(symbol, period)
-    if df.empty:
-        raise ValueError(
-            f"No data returned for {symbol} from NSE India. "
-            "Check that the symbol is a valid NSE equity and that nseindia.com is reachable."
-        )
-    df.index.name = "Date"
-    return df
+    if not df.empty:
+        df.index.name = "Date"
+        return df
+    log.info("NSE direct failed for %s, trying yfinance fallback", symbol)
+    df = _yf_download(f"{symbol}.NS", period)
+    if not df.empty:
+        return df
+    raise ValueError(
+        f"No data returned for {symbol}. "
+        "NSE India may be unreachable and yfinance did not return data either."
+    )
 
 
 def get_live_quote(symbol: str) -> dict:
@@ -328,24 +387,42 @@ def get_live_quote(symbol: str) -> dict:
             "52w_low": price_info.get("weekHighLow", {}).get("min"),
         }
     client = _get_nse()
-    if client is None:
-        raise ValueError("NSE is unreachable.")
-    q = client.get_quote(symbol)
-    if q is None:
-        raise ValueError(f"Could not fetch live quote for {symbol}.")
-    return {
-        "symbol": symbol,
-        "last_price": q.get("lastPrice"),
-        "change": q.get("change"),
-        "pct_change": q.get("pChange"),
-        "open": q.get("open"),
-        "high": q.get("dayHigh"),
-        "low": q.get("dayLow"),
-        "close": q.get("previousClose"),
-        "volume": q.get("totalTradedVolume"),
-        "52w_high": q.get("high52"),
-        "52w_low": q.get("low52"),
-    }
+    if client:
+        q = client.get_quote(symbol)
+        if q:
+            return {
+                "symbol": symbol,
+                "last_price": q.get("lastPrice"),
+                "change": q.get("change"),
+                "pct_change": q.get("pChange"),
+                "open": q.get("open"),
+                "high": q.get("dayHigh"),
+                "low": q.get("dayLow"),
+                "close": q.get("previousClose"),
+                "volume": q.get("totalTradedVolume"),
+                "52w_high": q.get("high52"),
+                "52w_low": q.get("low52"),
+            }
+    if _HAS_YFINANCE:
+        try:
+            t = yf.Ticker(f"{symbol}.NS")
+            info = t.info or {}
+            return {
+                "symbol": symbol,
+                "last_price": info.get("currentPrice") or info.get("regularMarketPrice"),
+                "change": info.get("regularMarketChange"),
+                "pct_change": info.get("regularMarketChangePercent"),
+                "open": info.get("regularMarketOpen"),
+                "high": info.get("regularMarketDayHigh"),
+                "low": info.get("regularMarketDayLow"),
+                "close": info.get("previousClose") or info.get("regularMarketPreviousClose"),
+                "volume": info.get("regularMarketVolume"),
+                "52w_high": info.get("fiftyTwoWeekHigh"),
+                "52w_low": info.get("fiftyTwoWeekLow"),
+            }
+        except Exception:
+            pass
+    raise ValueError(f"Could not fetch live quote for {symbol}.")
 
 
 def get_nifty50_stocks() -> list[str]:
@@ -371,6 +448,22 @@ def get_stock_info(symbol: str) -> dict:
             "52w_low": price_info.get("weekHighLow", {}).get("min"),
             "avg_volume": None,
         }
+    if _HAS_YFINANCE:
+        try:
+            info = yf.Ticker(f"{symbol}.NS").info or {}
+            return {
+                "symbol": symbol,
+                "name": info.get("longName") or info.get("shortName", symbol),
+                "sector": info.get("sector", "N/A"),
+                "industry": info.get("industry", "N/A"),
+                "market_cap": info.get("marketCap"),
+                "pe_ratio": info.get("trailingPE"),
+                "52w_high": info.get("fiftyTwoWeekHigh"),
+                "52w_low": info.get("fiftyTwoWeekLow"),
+                "avg_volume": info.get("averageVolume"),
+            }
+        except Exception:
+            pass
     return {
         "symbol": symbol, "name": symbol, "sector": "N/A", "industry": "N/A",
         "market_cap": None, "pe_ratio": None, "52w_high": None, "52w_low": None,
@@ -382,33 +475,58 @@ def get_fundamentals(symbol: str) -> dict:
     symbol = normalize_symbol(symbol)
     path = f"/api/quote-equity?symbol={quote(symbol)}"
     data = _nse_get_json(path)
-    base = {"symbol": symbol, "name": symbol, "sector": "N/A", "industry": "N/A"}
-    if not data:
-        return base
-    info = data.get("info", {})
-    meta = data.get("metadata", {})
-    price_info = data.get("priceInfo", {})
-    return {
-        "symbol": symbol,
-        "name": info.get("companyName") or meta.get("companyName", symbol),
-        "sector": meta.get("industry", "N/A"),
-        "industry": meta.get("industry", "N/A"),
-        "market_cap": None,
-        "trailing_pe": _safe_float(meta.get("pdSymbolPe")),
-        "forward_pe": None,
-        "trailing_eps": None,
-        "forward_eps": None,
-        "price_to_book": None,
-        "debt_to_equity": None,
-        "return_on_equity": None,
-        "revenue_growth": None,
-        "earnings_growth": None,
-        "dividend_yield": None,
-        "beta": None,
-        "52w_high": price_info.get("weekHighLow", {}).get("max"),
-        "52w_low": price_info.get("weekHighLow", {}).get("min"),
-        "avg_volume": None,
-    }
+    if data:
+        info = data.get("info", {})
+        meta = data.get("metadata", {})
+        price_info = data.get("priceInfo", {})
+        return {
+            "symbol": symbol,
+            "name": info.get("companyName") or meta.get("companyName", symbol),
+            "sector": meta.get("industry", "N/A"),
+            "industry": meta.get("industry", "N/A"),
+            "market_cap": None,
+            "trailing_pe": _safe_float(meta.get("pdSymbolPe")),
+            "forward_pe": None,
+            "trailing_eps": None,
+            "forward_eps": None,
+            "price_to_book": None,
+            "debt_to_equity": None,
+            "return_on_equity": None,
+            "revenue_growth": None,
+            "earnings_growth": None,
+            "dividend_yield": None,
+            "beta": None,
+            "52w_high": price_info.get("weekHighLow", {}).get("max"),
+            "52w_low": price_info.get("weekHighLow", {}).get("min"),
+            "avg_volume": None,
+        }
+    if _HAS_YFINANCE:
+        try:
+            info = yf.Ticker(f"{symbol}.NS").info or {}
+            return {
+                "symbol": symbol,
+                "name": info.get("longName") or info.get("shortName", symbol),
+                "sector": info.get("sector", "N/A"),
+                "industry": info.get("industry", "N/A"),
+                "market_cap": info.get("marketCap"),
+                "trailing_pe": _safe_float(info.get("trailingPE")),
+                "forward_pe": _safe_float(info.get("forwardPE")),
+                "trailing_eps": _safe_float(info.get("trailingEps")),
+                "forward_eps": _safe_float(info.get("forwardEps")),
+                "price_to_book": _safe_float(info.get("priceToBook")),
+                "debt_to_equity": _safe_float(info.get("debtToEquity")),
+                "return_on_equity": _safe_float(info.get("returnOnEquity")),
+                "revenue_growth": _safe_float(info.get("revenueGrowth")),
+                "earnings_growth": _safe_float(info.get("earningsGrowth")),
+                "dividend_yield": _safe_float(info.get("dividendYield")),
+                "beta": _safe_float(info.get("beta")),
+                "52w_high": info.get("fiftyTwoWeekHigh"),
+                "52w_low": info.get("fiftyTwoWeekLow"),
+                "avg_volume": info.get("averageVolume"),
+            }
+        except Exception:
+            pass
+    return {"symbol": symbol, "name": symbol, "sector": "N/A", "industry": "N/A"}
 
 
 def _safe_float(val) -> float | None:
@@ -425,10 +543,10 @@ def get_index_data(
     period: str = "6mo",
     interval: str = "1d",
 ) -> pd.DataFrame:
-    """Fetch historical OHLCV data for an NSE index."""
+    """Fetch historical OHLCV data — NSE India first, yfinance fallback."""
     key = index_name.upper()
     if interval != "1d":
-        raise ValueError(f"Only daily interval is supported for NSE index data (got {interval!r}).")
+        raise ValueError(f"Only daily interval is supported for index data (got {interval!r}).")
 
     for nse_type in _nse_index_type_variants(key):
         df = _nse_index_daily_ohlc(nse_type, period)
@@ -436,9 +554,16 @@ def get_index_data(
             df.index.name = "Date"
             return df
 
+    yf_ticker = _YF_INDEX_MAP.get(key)
+    if yf_ticker:
+        log.info("NSE direct failed for %s, trying yfinance (%s)", key, yf_ticker)
+        df = _yf_download(yf_ticker, period)
+        if not df.empty:
+            return df
+
     raise ValueError(
-        f"No data returned for index {index_name} from NSE India. "
-        "Ensure nseindia.com is reachable from your network."
+        f"No data returned for index {index_name}. "
+        "NSE India may be unreachable and yfinance did not return data either."
     )
 
 
@@ -446,27 +571,51 @@ def get_nifty_top_movers(max_symbols: int = 6) -> dict[str, list[dict]]:
     data = _nse_get_json("/api/equity-stockIndices?index=NIFTY%2050")
     gainers: list[dict] = []
     losers: list[dict] = []
-    if not data:
-        return {"top_gainers": [], "top_losers": []}
-    for item in (data.get("data") or [])[:max_symbols + 1]:
-        sym = item.get("symbol", "")
-        if sym == "NIFTY 50":
-            continue
-        price = _safe_float(item.get("lastPrice"))
-        pct = _safe_float(item.get("pChange"))
-        chg = _safe_float(item.get("change"))
-        if price is None or pct is None:
-            continue
-        entry = {
-            "symbol": sym,
-            "price": round(price, 2),
-            "change": round(chg, 2) if chg else 0,
-            "pct": round(pct, 2),
-        }
-        if pct >= 0:
-            gainers.append(entry)
-        else:
-            losers.append(entry)
+    if data:
+        for item in (data.get("data") or [])[:max_symbols + 1]:
+            sym = item.get("symbol", "")
+            if sym == "NIFTY 50":
+                continue
+            price = _safe_float(item.get("lastPrice"))
+            pct = _safe_float(item.get("pChange"))
+            chg = _safe_float(item.get("change"))
+            if price is None or pct is None:
+                continue
+            entry = {
+                "symbol": sym,
+                "price": round(price, 2),
+                "change": round(chg, 2) if chg else 0,
+                "pct": round(pct, 2),
+            }
+            if pct >= 0:
+                gainers.append(entry)
+            else:
+                losers.append(entry)
+    if not gainers and not losers and _HAS_YFINANCE:
+        sample = NIFTY50_SYMBOLS[:max_symbols]
+        tickers = " ".join(f"{s}.NS" for s in sample)
+        try:
+            df = yf.download(tickers, period="2d", interval="1d", progress=False, auto_adjust=True, group_by="ticker")
+            for sym in sample:
+                tk = f"{sym}.NS"
+                try:
+                    sub = df[tk] if tk in df.columns.get_level_values(0) else None
+                except Exception:
+                    sub = None
+                if sub is None or sub.empty or len(sub) < 2:
+                    continue
+                prev_c, last_c = float(sub["Close"].iloc[-2]), float(sub["Close"].iloc[-1])
+                if pd.isna(prev_c) or pd.isna(last_c) or prev_c == 0:
+                    continue
+                chg = round(last_c - prev_c, 2)
+                pct = round(((last_c - prev_c) / prev_c) * 100, 2)
+                entry = {"symbol": sym, "price": round(last_c, 2), "change": chg, "pct": pct}
+                if pct >= 0:
+                    gainers.append(entry)
+                else:
+                    losers.append(entry)
+        except Exception:
+            pass
     gainers.sort(key=lambda x: x["pct"], reverse=True)
     losers.sort(key=lambda x: x["pct"])
     return {"top_gainers": gainers[:5], "top_losers": losers[:5]}
