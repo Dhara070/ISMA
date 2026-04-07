@@ -369,6 +369,10 @@ with tab_nifty:
             st.error(f"Could not fetch Nifty 50 data: {e}")
             st.stop()
 
+        _nifty_src = nifty_df.attrs.get("data_source", "")
+        if "fallback" in _nifty_src.lower():
+            st.caption(f"⚠️ Data source: {_nifty_src} — NSE India blocked this server's IP. Prices may differ slightly.")
+
         nifty_fno = generate_fno_advisory(nifty_summary)
 
         snapshot: dict = {}
@@ -609,6 +613,10 @@ with tab_dashboard:
             except Exception as e:
                 st.error(f"Could not fetch data for **{symbol}**: {e}")
                 st.stop()
+
+            _stock_src = df.attrs.get("data_source", "")
+            if "fallback" in _stock_src.lower():
+                st.caption(f"⚠️ Data source: {_stock_src} — NSE India blocked this server's IP. Prices may differ slightly.")
 
             fundamentals = None
             news = []

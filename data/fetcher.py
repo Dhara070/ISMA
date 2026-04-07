@@ -315,11 +315,14 @@ _YF_INDEX_MAP: dict[str, str] = {
 
 
 def _yf_download(ticker: str, period: str) -> pd.DataFrame:
-    """Download OHLCV via yfinance and normalise column names."""
+    """Download OHLCV via yfinance and normalise column names.
+
+    Uses auto_adjust=False so OHLC prices match NSE's reported values.
+    """
     if not _HAS_YFINANCE:
         return pd.DataFrame()
     try:
-        df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
+        df = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=False)
     except Exception as exc:
         log.debug("yfinance download failed for %s: %s", ticker, exc)
         return pd.DataFrame()
@@ -356,10 +359,12 @@ def get_stock_data(
     df = _nse_equity_daily_ohlc(symbol, period)
     if not df.empty:
         df.index.name = "Date"
+        df.attrs["data_source"] = "NSE India"
         return df
     log.info("NSE direct failed for %s, trying yfinance fallback", symbol)
     df = _yf_download(f"{symbol}.NS", period)
     if not df.empty:
+        df.attrs["data_source"] = "Yahoo Finance (fallback)"
         return df
     raise ValueError(
         f"No data returned for {symbol}. "
@@ -552,6 +557,7 @@ def get_index_data(
         df = _nse_index_daily_ohlc(nse_type, period)
         if not df.empty:
             df.index.name = "Date"
+            df.attrs["data_source"] = "NSE India"
             return df
 
     yf_ticker = _YF_INDEX_MAP.get(key)
@@ -559,6 +565,7 @@ def get_index_data(
         log.info("NSE direct failed for %s, trying yfinance (%s)", key, yf_ticker)
         df = _yf_download(yf_ticker, period)
         if not df.empty:
+            df.attrs["data_source"] = "Yahoo Finance (fallback)"
             return df
 
     raise ValueError(
@@ -595,7 +602,7 @@ def get_nifty_top_movers(max_symbols: int = 6) -> dict[str, list[dict]]:
         sample = NIFTY50_SYMBOLS[:max_symbols]
         tickers = " ".join(f"{s}.NS" for s in sample)
         try:
-            df = yf.download(tickers, period="2d", interval="1d", progress=False, auto_adjust=True, group_by="ticker")
+            df = yf.download(tickers, period="2d", interval="1d", progress=False, auto_adjust=False, group_by="ticker")
             for sym in sample:
                 tk = f"{sym}.NS"
                 try:
