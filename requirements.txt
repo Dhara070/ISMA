@@ -1,0 +1,15 @@
+langchain
+langchain-ollama
+langchain-core
+langgraph
+nsetools
+requests>=2.28
+curl-cffi>=0.15
+truststore
+pandas
+lxml
+plotly
+streamlit
+typer[all]
+rich
+python-dotenv
