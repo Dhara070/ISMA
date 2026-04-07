@@ -344,6 +344,11 @@ def _format_mcap(mc):
 # Main layout
 # ──────────────────────────────────────────────
 st.markdown("## Indian Stock Market AI Agent")
+col_left, col_right = st.columns([12, 1])
+with col_right:
+    if st.button("🔄 Refresh Data", key="top_refresh", use_container_width=True, type="primary", help="Refresh all data"):
+        st.session_state.refresh_counter += 1
+        st.rerun()
 
 tab_nifty, tab_dashboard, tab_chat = st.tabs(["🏛️ Nifty Market & F&O", "📊 Stock Dashboard", "💬 AI Chat"])
 
